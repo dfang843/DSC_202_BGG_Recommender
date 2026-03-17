@@ -33,7 +33,7 @@ def run_pipeline(setup: bool = False) -> pd.DataFrame:
 
     # Stage 2: Graph similarity candidates
     print("\nFetching graph candidates from Neo4j...")
-    candidates_df = get_graph_candidates(profile)
+    candidates_df = get_graph_candidates(profile, verbose=True)
     print(f"{len(candidates_df)} total candidates returned from Neo4j.")
 
     # Stage 3: Relational scoring
