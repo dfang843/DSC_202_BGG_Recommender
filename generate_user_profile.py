@@ -57,10 +57,10 @@ def get_game_inputs() -> tuple[list[str], list[str]]:
 # ----------------------------
 CONSTRAINT_COMPONENT_MAP = {
     "max_playtime":   "playtime",
-    "min_rating":     "rating",
-    "min_players":    "players",
-    "max_players":    "players",
     "max_complexity": "complexity",
+    "min_players":    None,  # hard filter only, no scoring component
+    "max_players":    None,  # hard filter only, no scoring component
+    "min_rating":     None,  # hard filter only, no scoring component
 }
 
 def get_constraints() -> dict:
@@ -98,21 +98,16 @@ def get_constraints() -> dict:
 BASE_WEIGHTS = {
     "mechanics":  0.40,
     "graph":      0.20,
-    "complexity": 0.15,
-    "players":    0.10,
-    "rating":     0.10,
+    "complexity": 0.20,
+    "rank":       0.15,
     "playtime":   0.05,
 }
 
 def compute_active_weights(constraints: dict) -> dict[str, float]:
-    """
-    Remove scoring components covered by hard constraints,
-    redistribute their weights evenly across remaining components.
-    """
     removed = {
         CONSTRAINT_COMPONENT_MAP[k]
         for k in constraints
-        if k in CONSTRAINT_COMPONENT_MAP
+        if k in CONSTRAINT_COMPONENT_MAP and CONSTRAINT_COMPONENT_MAP[k] is not None
     }
     active = {k: v for k, v in BASE_WEIGHTS.items() if k not in removed}
     removed_weight = sum(BASE_WEIGHTS[k] for k in removed)
@@ -142,117 +137,112 @@ def query_mechanic_weights(
     liked_games: list[str],
     disliked_games: list[str]
 ) -> dict[str, float]:
-    total = len(liked_games) + len(disliked_games)
+    """
+    SQL now computes the full weight formula directly.
+    Python just reads the results.
+    """
     all_games = liked_games + disliked_games
-
-    # If no games at all, return empty
     if not all_games:
         return {}
+
+    total = len(liked_games) + len(disliked_games)
+    disliked_param = tuple(n.lower() for n in disliked_games) or ('__none__',)
 
     query = text("""
         SELECT
             gm.mechanic_name,
-            SUM(CASE WHEN LOWER(g.name) IN :liked    THEN 1 ELSE 0 END) AS count_l,
-            SUM(CASE WHEN LOWER(g.name) IN :disliked THEN 1 ELSE 0 END) AS count_d
+            (SUM(CASE WHEN LOWER(g.name) IN :liked    THEN 1 ELSE 0 END) -
+             SUM(CASE WHEN LOWER(g.name) IN :disliked THEN 1 ELSE 0 END))::float
+             / :total AS mechanic_weight
         FROM game_mechanics gm
         JOIN games_base g ON gm.game_id = g.id
         WHERE LOWER(g.name) IN :all_games
         GROUP BY gm.mechanic_name
     """)
 
-    # Use a placeholder tuple for disliked if empty to avoid IN () SQL error
-    disliked_param = tuple(n.lower() for n in disliked_games) or ('__none__',)
-
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params={
             "liked":     tuple(n.lower() for n in liked_games),
             "disliked":  disliked_param,
             "all_games": tuple(n.lower() for n in all_games),
+            "total":     total,
         })
 
-    return {
-        row.mechanic_name: round((row.count_l - row.count_d) / total, 6)
-        for row in df.itertuples()
-    }
+    return dict(zip(df["mechanic_name"], df["mechanic_weight"].round(6)))
+
+
 
 # ----------------------------
-# SQL: Domain weights
+# SQL: Domain weights - no longer used
 # ----------------------------
 def query_domain_weights(
     liked_games: list[str],
     disliked_games: list[str]
 ) -> dict[str, float]:
-    total = len(liked_games) + len(disliked_games)
+    """
+    SQL now computes the full weight formula directly.
+    Python just reads the results.
+    """
     all_games = liked_games + disliked_games
-
-    # If no games at all, return empty
     if not all_games:
         return {}
+
+    total = len(liked_games) + len(disliked_games)
+    disliked_param = tuple(n.lower() for n in disliked_games) or ('__none__',)
 
     query = text("""
         SELECT
             gd.domain_name,
-            SUM(CASE WHEN LOWER(g.name) IN :liked    THEN 1 ELSE 0 END) AS count_l,
-            SUM(CASE WHEN LOWER(g.name) IN :disliked THEN 1 ELSE 0 END) AS count_d
+            (SUM(CASE WHEN LOWER(g.name) IN :liked    THEN 1 ELSE 0 END) -
+             SUM(CASE WHEN LOWER(g.name) IN :disliked THEN 1 ELSE 0 END))::float
+             / :total AS domain_weight
         FROM game_domains gd
         JOIN games_base g ON gd.game_id = g.id
         WHERE LOWER(g.name) IN :all_games
         GROUP BY gd.domain_name
     """)
 
-    # Use a placeholder tuple for disliked if empty to avoid IN () SQL error
-    disliked_param = tuple(n.lower() for n in disliked_games) or ('__none__',)
-
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params={
             "liked":     tuple(n.lower() for n in liked_games),
             "disliked":  disliked_param,
             "all_games": tuple(n.lower() for n in all_games),
+            "total":     total,
         })
 
-    return {
-        row.domain_name: round((row.count_l - row.count_d) / total, 6)
-        for row in df.itertuples()
-    }
+    return dict(zip(df["domain_name"], df["domain_weight"].round(6)))
+
 
 # ----------------------------
-# SQL: Numeric feature preferences
+# SQL: Numeric weights
 # ----------------------------
-def query_numeric_preferences(liked_games: list[str]) -> dict[str, float]:
+def query_numeric_preferences(liked_games: list[str]) -> dict:
+    """
+    SQL now computes averages and complexity bin in one query.
+    Python just reads the results.
+    """
     with engine.connect() as conn:
-        # Numeric averages — unchanged
         result = conn.execute(text("""
             SELECT
-                AVG(g.complexity_average)                    AS preferred_complexity,
-                AVG((g.min_players + g.max_players) / 2.0)   AS preferred_player_midpoint,
-                AVG(gs.play_time)                            AS preferred_playtime,
-                AVG(g.rating_average)                        AS preferred_rating
+                AVG(g.complexity_average)  AS preferred_complexity,
+                AVG(gs.play_time)          AS preferred_playtime,
+                CASE
+                    WHEN AVG(g.complexity_average) <= 1.5 THEN 'Very Low'
+                    WHEN AVG(g.complexity_average) <= 2.0 THEN 'Low'
+                    WHEN AVG(g.complexity_average) <= 2.5 THEN 'Medium'
+                    WHEN AVG(g.complexity_average) <= 3.0 THEN 'High'
+                    ELSE 'Very High'
+                END AS preferred_complexity_bin
             FROM games_base g
-            JOIN boardgames gs ON g.id = gs.id
+            JOIN games gs ON g.id = gs.id
             WHERE LOWER(g.name) IN :liked_games
         """), {"liked_games": tuple(n.lower() for n in liked_games)})
         row = result.fetchone()
 
-        # Most common complexity bin among liked games (deduplicated by game)
-        bin_result = conn.execute(text("""
-            SELECT complexity_bin, COUNT(*) AS freq
-            FROM (
-                SELECT DISTINCT name, complexity_bin
-                FROM games_base
-                WHERE LOWER(name) IN :liked_games
-            ) AS deduped
-            GROUP BY complexity_bin
-            ORDER BY freq DESC
-            LIMIT 1
-        """), {"liked_games": tuple(n.lower() for n in liked_games)})
-        bin_row = bin_result.fetchone()
-
     return {
-        "preferred_complexity":      round(float(row.preferred_complexity), 4),
-        "preferred_player_midpoint": round(float(row.preferred_player_midpoint), 4),
-        "preferred_playtime":        round(float(row.preferred_playtime), 4),
-        "preferred_rating":          round(float(row.preferred_rating), 4),
-        "preferred_complexity_bin":  get_complexity_bin(float(row.preferred_complexity)),
+        "preferred_complexity":     round(float(row.preferred_complexity), 4),
+        "preferred_complexity_bin": row.preferred_complexity_bin,
+        "preferred_playtime":       round(float(row.preferred_playtime), 4),
     }
 
 # ----------------------------
@@ -294,9 +284,7 @@ def print_profile(profile: dict, verbose: bool = False) -> None:
 
     if verbose:
         print(f"Preferred complexity:      {profile['preferred_complexity']} ({profile['preferred_complexity_bin']})")
-        print(f"Preferred player midpoint: {profile['preferred_player_midpoint']}")
         print(f"Preferred playtime:        {profile['preferred_playtime']}")
-        print(f"Preferred rating:          {profile['preferred_rating']}")
 
         print(f"\nMechanic weights ({len(profile['mechanic_weights'])} mechanics tracked):")
         for m, w in sorted(profile['mechanic_weights'].items(), key=lambda x: -x[1]):
